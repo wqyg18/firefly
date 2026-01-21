@@ -1,0 +1,20 @@
+[project]
+name = "nano-demo"
+version = "0.1.0"
+description = "A minimal LLM inference demo"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "transformers>=4.45.0",
+    "torch>=2.4.0",
+    "accelerate>=0.26.0", # 用于自动管理设备映射 (device_map)
+    "icecream>=2.1.9",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
