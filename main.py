@@ -1,169 +1,172 @@
 import time
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Deque, List, Optional
+from typing import Optional, Any, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+# ===============================
+# Request State
+# ===============================
 @dataclass
 class RequestState:
     req_id: int
     prompt: str
-    prompt_ids: torch.Tensor  # [1, S]
+    prompt_ids: torch.Tensor        # [1, S_i]
+    attention_mask: torch.Tensor    # [1, S_i]
     past_key_values: Optional[Any] = None
-    current_token: Optional[torch.Tensor] = (
-        None  # [1, 1] token used as input for next decode step
-    )
+    current_token: Optional[torch.Tensor] = None  # [1, 1]
     generated_ids: List[int] = field(default_factory=list)
-    done: bool = False
-    printed_text: str = ""  # for debugging / optional
 
 
+# ===============================
+# Batched Prefill with Padding
+# ===============================
 @torch.inference_mode()
-def prefill(model, tokenizer, state: RequestState) -> str:
-    """Run one prompt forward, create KV cache and the first generated token."""
-    outputs = model(state.prompt_ids, use_cache=True)
-    state.past_key_values = outputs.past_key_values
+def prefill_batch_with_padding(model, states: List[RequestState], pad_token_id: int):
+    """
+    Pad prompt_ids to the same length, then run one batched forward.
+    """
+    # 1. 找最大 prompt 长度
+    max_len = max(s.prompt_ids.shape[1] for s in states)
 
-    logits = outputs.logits[:, -1, :]  # [1, vocab]
-    state.current_token = torch.argmax(logits, dim=-1, keepdim=True)  # [1,1]
+    padded_ids = []
+    padded_masks = []
 
-    tok_id = int(state.current_token.item())
-    state.generated_ids.append(tok_id)
+    for s in states:
+        seq_len = s.prompt_ids.shape[1]
+        pad_len = max_len - seq_len
 
-    piece = tokenizer.decode([tok_id], skip_special_tokens=False)
-    return piece
+        # pad input_ids
+        if pad_len > 0:
+            pad_ids = torch.full(
+                (1, pad_len),
+                pad_token_id,
+                device=s.prompt_ids.device,
+                dtype=s.prompt_ids.dtype,
+            )
+            ids = torch.cat([s.prompt_ids, pad_ids], dim=1)
+        else:
+            ids = s.prompt_ids
 
+        # pad attention_mask (0 = pad, 1 = real token)
+        if pad_len > 0:
+            pad_mask = torch.zeros((1, pad_len), device=s.attention_mask.device)
+            mask = torch.cat([s.attention_mask, pad_mask], dim=1)
+        else:
+            mask = s.attention_mask
 
-@torch.inference_mode()
-def decode_step(model, state: RequestState, eos_token_id: Optional[int]) -> int:
-    """Decode exactly one token for this request."""
+        padded_ids.append(ids)
+        padded_masks.append(mask)
+
+    # [B, max_len]
+    batched_ids = torch.cat(padded_ids, dim=0)
+    batched_mask = torch.cat(padded_masks, dim=0)
+
     outputs = model(
-        input_ids=state.current_token,
-        past_key_values=state.past_key_values,
+        input_ids=batched_ids,
+        attention_mask=batched_mask,
         use_cache=True,
     )
-    state.past_key_values = outputs.past_key_values
 
+    batched_past_kv = outputs.past_key_values
+    logits = outputs.logits[:, -1, :]        # [B, vocab]
+    next_tokens = torch.argmax(logits, dim=-1)  # [B]
+
+    for i, s in enumerate(states):
+        s.past_key_values = batched_past_kv
+        tok = next_tokens[i].view(1, 1)
+        s.current_token = tok
+        s.generated_ids.append(int(tok.item()))
+
+
+# ===============================
+# Batched Decode Step (no padding needed here)
+# ===============================
+@torch.inference_mode()
+def decode_step_batch(model, states: List[RequestState]):
+    """
+    Decode one token for each request using a single batched forward.
+    Assumes all requests are aligned in decode steps.
+    """
+    # [B, 1]
+    batched_tokens = torch.cat([s.current_token for s in states], dim=0)
+
+    batched_past_kv = states[0].past_key_values  # static batch assumption
+
+    outputs = model(
+        input_ids=batched_tokens,
+        past_key_values=batched_past_kv,
+        use_cache=True,
+    )
+
+    batched_past_kv = outputs.past_key_values
     logits = outputs.logits[:, -1, :]
-    state.current_token = torch.argmax(logits, dim=-1, keepdim=True)
+    next_tokens = torch.argmax(logits, dim=-1)
 
-    tok_id = int(state.current_token.item())
-    state.generated_ids.append(tok_id)
-
-    if eos_token_id is not None and tok_id == eos_token_id:
-        state.done = True
-
-    return tok_id
+    for i, s in enumerate(states):
+        s.past_key_values = batched_past_kv
+        tok = next_tokens[i].view(1, 1)
+        s.current_token = tok
+        s.generated_ids.append(int(tok.item()))
 
 
-def make_state(req_id: int, prompt: str, tokenizer, device: str) -> RequestState:
-    prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    return RequestState(req_id=req_id, prompt=prompt, prompt_ids=prompt_ids)
-
-
+# ===============================
+# Main
+# ===============================
 def main():
     device = "cuda"
     model_id = "Qwen/Qwen2.5-0.5B"
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id, dtype="auto", device_map=device
     )
     model.eval()
 
-    eos_token_id = tokenizer.eos_token_id
-
-    # -----------------------------
-    # Stage 1: queues + scheduler
-    # -----------------------------
-    waiting: Deque[RequestState] = deque()
-    active: List[RequestState] = []
-    finished: List[RequestState] = []
-
-    # 你可以把这里换成真实服务的“到达请求”
     prompts = [
         "Tell me a short joke about GPUs.",
-        "Write a 1-sentence summary of what a KV cache is.",
-        "Give me three tips for debugging CUDA OOM in PyTorch.",
+        "Write a 1-sentence summary of what a KV cache is in transformers.",
     ]
+
+    states: List[RequestState] = []
     for i, p in enumerate(prompts):
-        waiting.append(make_state(i, p, tokenizer, device))
+        enc = tokenizer(p, return_tensors="pt")
+        states.append(
+            RequestState(
+                req_id=i,
+                prompt=p,
+                prompt_ids=enc.input_ids.to(device),
+                attention_mask=enc.attention_mask.to(device),
+            )
+        )
 
-    # 关键：Stage 1 不做 batching，但要限制同时活跃请求数（模拟并发窗口）
-    max_active = 2
-    max_new_tokens = 60  # per request
+    print("=== Stage 2: Static Batching with Padding ===")
 
-    print("=== Stage 1: Multi-Request Decode (no batching) ===")
-
-    # 记录每个请求已生成 token 数（不含 prompt）
-    gen_budget = {}  # req_id -> remaining steps
-
-    # 主调度循环：每一“轮”推进 active 里的每个请求一步
-    round_idx = 0
+    # -------- Prefill --------
     t0 = time.time()
+    prefill_batch_with_padding(model, states, tokenizer.pad_token_id)
+    print(f"[Prefill done] time={time.time() - t0:.4f}s")
 
-    while waiting or active:
-        # 1) 补充活跃请求（continuous admission，但仍是 no-batching）
-        while waiting and len(active) < max_active:
-            req = waiting.popleft()  # 左边为头部
-            active.append(req)
-            gen_budget[req.req_id] = max_new_tokens
+    for s in states:
+        print(f"[req={s.req_id}] {tokenizer.decode([s.generated_ids[-1]])}")
 
-            first_piece = prefill(model, tokenizer, req)
-            gen_budget[req.req_id] -= 1
+    # -------- Decode --------
+    max_new_tokens = 30
+    t1 = time.time()
 
-            print(f"\n[ADMIT req={req.req_id}] prompt: {req.prompt}")
-            print(f"[req={req.req_id}] {first_piece}")
+    for step in range(max_new_tokens - 1):
+        decode_step_batch(model, states)
+        for s in states:
+            print(f"[req={s.req_id}] {tokenizer.decode([s.generated_ids[-1]])}")
 
-            # prefill 后就可能 eos（极少见，但处理一下）
-            if req.done or gen_budget[req.req_id] <= 0:
-                req.done = True
-                print(f"\n[req={req.req_id}] <DONE after prefill>")
-        if not active:
-            continue
-
-        # 2) 轮询推进：对 active 中每个请求 decode 一步
-        round_idx += 1
-        # 注意：遍历时可能移除，所以用索引方式更安全
-        i = 0
-        while i < len(active):
-            req = active[i]
-
-            # 如果已经没预算，直接结束
-            if gen_budget[req.req_id] <= 0:
-                req.done = True
-
-            if req.done:
-                print(
-                    f"\n[FINISH req={req.req_id}] generated={len(req.generated_ids)} tokens"
-                )
-                finished.append(req)
-                active.pop(i)
-                continue  # 不 i+=1，因为 pop 后当前 i 已是下一个元素
-
-            tok_id = decode_step(model, req, eos_token_id)
-            gen_budget[req.req_id] -= 1
-
-            piece = tokenizer.decode([tok_id], skip_special_tokens=False)
-            print(f"[req={req.req_id}] {piece}")
-
-            # 完成则移出 active
-            if req.done or gen_budget[req.req_id] <= 0:
-                req.done = True
-                print(
-                    f"\n[FINISH req={req.req_id}] generated={len(req.generated_ids)} tokens"
-                )
-                finished.append(req)
-                active.pop(i)
-                continue
-
-            i += 1
-
-    total = time.time() - t0
-    print(f"\n\n=== All done. finished={len(finished)} total_time={total:.3f}s ===")
+    total = time.time() - t1
+    print(f"\n[Decode done] tokens/request={max_new_tokens} time={total:.4f}s")
+    print(f"Avg per-token time (batched): {total / max_new_tokens:.4f}s")
 
 
 if __name__ == "__main__":
