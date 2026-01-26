@@ -5,6 +5,24 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 
+class SimpleScheduler:
+    def __init__(self, states, eos_token_id):
+        self.active = states
+        self.eos_token_id = eos_token_id
+
+    def schedule(self):
+        # all states that are not finished
+        return [s for s in self.active if not s.is_finished]
+
+    def update(self, states):
+        for s in states:
+            if (
+                s.current_token.item() == self.eos_token_id
+                or len(s.generated_ids) >= s.max_tokens
+            ):
+                s.is_finished = True
+
+
 @dataclass
 class RequestState:
     """
@@ -20,6 +38,7 @@ class RequestState:
     current_token: Optional[torch.Tensor] = None
     generated_ids: List[int] = field(default_factory=list)
     is_finished: bool = False
+    max_tokens: int = 128
 
 
 def split_to_states(
@@ -196,14 +215,22 @@ def main():
         for i, p in enumerate(prompts)
     ]
 
+    scheduler = SimpleScheduler(states, eos_token_id=tokenizer.eos_token_id)
+
     print("--- Prefill ---")
     prefill_batch(model, states, tokenizer.pad_token_id)
 
     print("--- Decoding ---")
-    for _ in range(10):
-        decode_step_batch(model, states)
-        tokens = [tokenizer.decode([s.generated_ids[-1]]) for s in states]
-        print(tokens)
+    while True:
+        active_states = scheduler.schedule()
+        if len(active_states) == 0:
+            break
+
+        decode_step_batch(model, active_states)
+        scheduler.update(active_states)
+
+        active_tokens = [tokenizer.decode([s.generated_ids[-1]]) for s in active_states]
+        print(f"Active Batch IDs {[s.req_id for s in active_states]}: {active_tokens}")
 
 
 if __name__ == "__main__":
