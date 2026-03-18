@@ -1,6 +1,7 @@
 import torch
 from typing import List, Tuple
 import math
+import torch.nn as nn
 
 
 class KVCache:
@@ -12,30 +13,34 @@ class KVCache:
     Attributes:
         num_blocks: Total number of blocks available.
         block_size: Number of tokens per block.
-        num_heads: Number of attention heads.
+        num_kv_heads: Number of KV heads.
         head_dim: Dimension per head.
 
         K: Tensor storing all key vectors.
-           Shape: [num_blocks, block_size, num_heads, head_dim]
+           Shape: [num_blocks, block_size, num_kv_heads, head_dim]
 
         V: Tensor storing all value vectors.
-           Shape: [num_blocks, block_size, num_heads, head_dim]
+           Shape: [num_blocks, block_size, num_kv_heads, head_dim]
     """
 
     def __init__(
         self,
         num_blocks: int,
         block_size: int,
-        num_heads: int,
+        num_kv_heads: int,
         head_dim: int,
         device: str = "cpu",
     ):
-        self.k = torch.zeros(num_blocks, block_size, num_heads, head_dim, device=device)
-        self.v = torch.zeros(num_blocks, block_size, num_heads, head_dim, device=device)
+        self.k = torch.zeros(
+            num_blocks, block_size, num_kv_heads, head_dim, device=device
+        )
+        self.v = torch.zeros(
+            num_blocks, block_size, num_kv_heads, head_dim, device=device
+        )
 
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
 
     def write(
@@ -51,8 +56,8 @@ class KVCache:
         Args:
             block_id: Which block to write to.
             offset: Position inside the block (0 <= offset < block_size).
-            k: Key tensor of shape [num_heads, head_dim]
-            v: Value tensor of shape [num_heads, head_dim]
+            k: Key tensor of shape [num_kv_heads, head_dim]
+            v: Value tensor of shape [num_kv_heads, head_dim]
         """
         self.k[block_id][offset] = k
         self.v[block_id][offset] = v
@@ -65,10 +70,31 @@ class KVCache:
         Read the entire block (all tokens in it).
 
         Returns:
-            K_block: [block_size, num_heads, head_dim]
-            V_block: [block_size, num_heads, head_dim]
+            K_block: [block_size, num_kv_heads, head_dim]
+            V_block: [block_size, num_kv_heads, head_dim]
         """
         return self.k[block_id], self.v[block_id]
+
+
+def repeat_kv_heads(kv: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """
+    Expand KV heads for GQA/MQA: num_heads can be larger than num_kv_heads.
+
+    Args:
+        kv: [T, num_kv_heads, head_dim]
+        num_heads: query heads
+    Returns:
+        [T, num_heads, head_dim]
+    """
+    num_kv_heads = kv.shape[1]
+    if num_heads == num_kv_heads:
+        return kv
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_heads({num_heads}) must be divisible by num_kv_heads({num_kv_heads})."
+        )
+    repeat_factor = num_heads // num_kv_heads
+    return kv.repeat_interleave(repeat_factor, dim=1)
 
 
 class BlockManager:
@@ -243,6 +269,10 @@ class PageAttention:
         # 由于最后一个block可能是不满的, 所以需要trim到真实的seq_len
         k_all = k_all[: req.seq_len]
         v_all = v_all[: req.seq_len]
+        # 当使用 GQA/MQA 时, q 的头数和 kv 头数不同.
+        # 这里将 kv 头扩展到 q 头维度, 便于沿用同一个注意力公式.
+        k_all = repeat_kv_heads(k_all, q.shape[0])
+        v_all = repeat_kv_heads(v_all, q.shape[0])
 
         # 基于kv计算q的attention分数
         # attention(q,k,v) = softmax((q \cdot k^T) / sqrt(head_dim)) \cdot v
@@ -251,6 +281,73 @@ class PageAttention:
         output = torch.einsum("ht,thd->hd", attn, v_all)
 
         return output
+
+
+class SelfAttention(nn.Module):
+    """
+    Minimal single-token self-attention block.
+
+    目标:
+    1) 提供真实的 q_proj/k_proj/v_proj/o_proj
+    2) 支持 num_heads != num_kv_heads (GQA/MQA)
+    3) 复用 PageAttention + KVCache 做 decode
+    """
+
+    def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int):
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads.")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads.")
+
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = hidden_size // num_heads
+
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def project(
+        self, hidden: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Project one token hidden state to q/k/v.
+        Args:
+            hidden: [hidden_size]
+        Returns:
+            q: [num_heads, head_dim]
+            k: [num_kv_heads, head_dim]
+            v: [num_kv_heads, head_dim]
+        """
+        q = self.q_proj(hidden).view(self.num_heads, self.head_dim)
+        k = self.k_proj(hidden).view(self.num_kv_heads, self.head_dim)
+        v = self.v_proj(hidden).view(self.num_kv_heads, self.head_dim)
+        return q, k, v
+
+    def combine_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [num_heads, head_dim]
+        Returns:
+            [hidden_size]
+        """
+        return x.reshape(self.hidden_size)
+
+    def forward_standard(
+        self, q: torch.Tensor, k_all: torch.Tensor, v_all: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Reference attention on contiguous KV.
+        用于对齐验证 PageAttention 的输出.
+        """
+        k_all = repeat_kv_heads(k_all, self.num_heads)
+        v_all = repeat_kv_heads(v_all, self.num_heads)
+        scores = torch.einsum("hd,thd->ht", q, k_all) / math.sqrt(self.head_dim)
+        attn = torch.softmax(scores, dim=-1)
+        return torch.einsum("ht,thd->hd", attn, v_all)
 
 
 class DecoderEngine:
@@ -317,24 +414,34 @@ def run_toy_example():
     num_blocks = 8
     block_size = 4
     num_heads = 2
+    num_kv_heads = 1
     head_dim = 8
+    hidden_size = num_heads * head_dim
 
     kv_cache = KVCache(
         num_blocks=num_blocks,
         block_size=block_size,
-        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=head_dim,
     )
     block_manager = BlockManager(num_blocks)
     attention = PageAttention()
     engine = DecoderEngine(kv_cache, block_manager, attention)
+    self_attn = SelfAttention(
+        hidden_size=hidden_size, num_heads=num_heads, num_kv_heads=num_kv_heads
+    )
 
     req = Request()
 
     # prefill 6 tokens
     prefill_len = 6
-    k_list = [torch.randn(num_heads, head_dim) for _ in range(prefill_len)]
-    v_list = [torch.randn(num_heads, head_dim) for _ in range(prefill_len)]
+    hidden_list = [torch.randn(hidden_size) for _ in range(prefill_len)]
+    k_list = []
+    v_list = []
+    for h in hidden_list:
+        _, k, v = self_attn.project(h)
+        k_list.append(k)
+        v_list.append(v)
 
     engine.prefill(req, k_list, v_list)
 
@@ -344,14 +451,15 @@ def run_toy_example():
 
     # decode 3 steps
     for step in range(3):
-        q = torch.randn(num_heads, head_dim)
-        new_k = torch.randn(num_heads, head_dim)
-        new_v = torch.randn(num_heads, head_dim)
+        hidden = torch.randn(hidden_size)
+        q, new_k, new_v = self_attn.project(hidden)
 
         out = engine.decode_step(req, q, new_k, new_v)
+        out_hidden = self_attn.o_proj(self_attn.combine_heads(out))
 
         print(f"\nDecode step {step}:")
         print("output shape =", out.shape)
+        print("output hidden shape =", out_hidden.shape)
         print("seq_len =", req.seq_len)
         print("block_table =", req.block_table)
 
