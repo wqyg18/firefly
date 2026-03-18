@@ -147,6 +147,7 @@ class Request:
         """
         self.block_table: List[int] = []
         self.seq_len: int = 0
+        self.position_ids: List[int] = []
 
     def last_block(self) -> int:
         """
@@ -201,6 +202,7 @@ def append_token(
 
     kv_cache.write(last_block, offset, k, v)
 
+    req.position_ids.append(req.seq_len)
     req.seq_len += 1
 
 
@@ -212,6 +214,7 @@ def release_request(req: Request, block_manager: BlockManager):
 
     req.seq_len = 0
     req.block_table.clear()
+    req.position_ids.clear()
     print(f"release current seq, return {release_len} blocks to kvcache")
 
 
@@ -336,6 +339,48 @@ class SelfAttention(nn.Module):
         """
         return x.reshape(self.hidden_size)
 
+    @staticmethod
+    def _build_rope_cache(
+        head_dim: int, position_id: int, base: float, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if head_dim % 2 != 0:
+            raise ValueError("head_dim must be even when using RoPE.")
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
+        )
+        pos = torch.tensor(position_id, device=device, dtype=torch.float32)
+        freqs = pos * inv_freq
+        cos = torch.cos(freqs).to(dtype=dtype)
+        sin = torch.sin(freqs).to(dtype=dtype)
+        return cos, sin
+
+    def apply_rope(
+        self, x: torch.Tensor, position_id: int, base: float = 10000.0
+    ) -> torch.Tensor:
+        """
+        Apply RoPE to per-token head vectors.
+        Args:
+            x: [num_heads_or_kv_heads, head_dim]
+            position_id: scalar position index for this token
+        Returns:
+            tensor with same shape as x
+        """
+        cos, sin = self._build_rope_cache(
+            head_dim=x.shape[-1],
+            position_id=position_id,
+            base=base,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        out_even = x_even * cos - x_odd * sin
+        out_odd = x_even * sin + x_odd * cos
+        out = torch.empty_like(x)
+        out[..., 0::2] = out_even
+        out[..., 1::2] = out_odd
+        return out
+
     def forward_standard(
         self, q: torch.Tensor, k_all: torch.Tensor, v_all: torch.Tensor
     ) -> torch.Tensor:
@@ -438,8 +483,9 @@ def run_toy_example():
     hidden_list = [torch.randn(hidden_size) for _ in range(prefill_len)]
     k_list = []
     v_list = []
-    for h in hidden_list:
+    for i, h in enumerate(hidden_list):
         _, k, v = self_attn.project(h)
+        k = self_attn.apply_rope(k, position_id=i)
         k_list.append(k)
         v_list.append(v)
 
@@ -449,12 +495,31 @@ def run_toy_example():
     print("seq_len =", req.seq_len)
     print("block_table =", req.block_table)
 
-    # decode 3 steps
+    # decode 3 steps + RoPE/page attention alignment check
+    all_hidden = hidden_list[:]
     for step in range(3):
         hidden = torch.randn(hidden_size)
+        all_hidden.append(hidden)
         q, new_k, new_v = self_attn.project(hidden)
+        pos_id = req.seq_len
+        q = self_attn.apply_rope(q, position_id=pos_id)
+        new_k = self_attn.apply_rope(new_k, position_id=pos_id)
 
         out = engine.decode_step(req, q, new_k, new_v)
+        # baseline: contiguous KV with same RoPE logic
+        k_all = []
+        v_all = []
+        for p, h in enumerate(all_hidden):
+            _, k_ref, v_ref = self_attn.project(h)
+            k_ref = self_attn.apply_rope(k_ref, position_id=p)
+            k_all.append(k_ref)
+            v_all.append(v_ref)
+        k_all = torch.stack(k_all, dim=0)
+        v_all = torch.stack(v_all, dim=0)
+        out_ref = self_attn.forward_standard(q, k_all, v_all)
+        if not torch.allclose(out, out_ref, atol=1e-5, rtol=1e-5):
+            raise RuntimeError(f"RoPE alignment check failed at decode step {step}.")
+
         out_hidden = self_attn.o_proj(self_attn.combine_heads(out))
 
         print(f"\nDecode step {step}:")
@@ -462,6 +527,7 @@ def run_toy_example():
         print("output hidden shape =", out_hidden.shape)
         print("seq_len =", req.seq_len)
         print("block_table =", req.block_table)
+        print("position_ids =", req.position_ids)
 
     # decode结束, 释放block
     release_request(req, block_manager)

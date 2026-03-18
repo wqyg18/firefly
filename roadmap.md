@@ -38,28 +38,28 @@
 
 ## ✅ Attention 模块
 
-- [ ] 实现 `SelfAttention`（最小版本）
-- [ ] 添加 `q_proj / k_proj / v_proj / o_proj`
-- [ ] 支持 multi-head reshape（[H, D]）
+- [x] 实现 `SelfAttention`（最小版本）
+- [x] 添加 `q_proj / k_proj / v_proj / o_proj`
+- [x] 支持 multi-head reshape（[H, D]）
 
 ## ✅ KV Cache 结构升级
 
-- [ ] 将 KVCache 支持 `num_kv_heads`（而非 num_heads）
-- [ ] 修改 KV tensor shape：
-  - [ ] K: `[num_blocks, block_size, num_kv_heads, head_dim]`
-  - [ ] V: 同上
+- [x] 将 KVCache 支持 `num_kv_heads`（而非 num_heads）
+- [x] 修改 KV tensor shape：
+  - [x] K: `[num_blocks, block_size, num_kv_heads, head_dim]`
+  - [x] V: 同上
 
 ## ✅ Attention 适配
 
-- [ ] 支持 `num_heads != num_kv_heads`（GQA / MQA）
-- [ ] 实现 head mapping / repeat KV heads
+- [x] 支持 `num_heads != num_kv_heads`（GQA / MQA）
+- [x] 实现 head mapping / repeat KV heads
 
 ## ✅ 对齐验证
 
-- [ ] 使用同一输入 hidden state：
-  - [ ] 标准 attention
-  - [ ] PageAttention
-- [ ] 验证输出一致
+- [x] 使用同一输入 hidden state：
+  - [x] 标准 attention
+  - [x] PageAttention
+- [x] 验证输出一致
 
 ---
 
@@ -69,22 +69,22 @@
 
 ## ✅ Position 管理
 
-- [ ] 为每个 token 维护 `position_id`
-- [ ] prefill: 0 → T-1
-- [ ] decode: 使用当前 `seq_len`
+- [x] 为每个 token 维护 `position_id`
+- [x] prefill: 0 → T-1
+- [x] decode: 使用当前 `seq_len`
 
 ## ✅ RoPE 实现
 
-- [ ] 实现 `apply_rope(q, pos)`
-- [ ] 实现 `apply_rope(k, pos)`
-- [ ] 确保 k 写入 cache 前已应用 RoPE
+- [x] 实现 `apply_rope(q, pos)`
+- [x] 实现 `apply_rope(k, pos)`
+- [x] 确保 k 写入 cache 前已应用 RoPE
 
 ## ✅ 验证
 
-- [ ] 对比：
-  - [ ] 标准 RoPE attention
-  - [ ] paged attention + RoPE
-- [ ] 确认一致性
+- [x] 对比：
+  - [x] 标准 RoPE attention
+  - [x] paged attention + RoPE
+- [x] 确认一致性
 
 ---
 
