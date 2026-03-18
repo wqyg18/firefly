@@ -178,6 +178,17 @@ def append_token(
     req.seq_len += 1
 
 
+def release_request(req: Request, block_manager: BlockManager):
+    release_len = len(req.block_table)
+    # 释放所有的block
+    for block_id in req.block_table:
+        block_manager.free(block_id)
+
+    req.seq_len = 0
+    req.block_table.clear()
+    print(f"release current seq, return {release_len} blocks to kvcache")
+
+
 class PageAttention:
     """
     Naive PageAttention implementation (no CUDA optimization).
@@ -343,6 +354,9 @@ def run_toy_example():
         print("output shape =", out.shape)
         print("seq_len =", req.seq_len)
         print("block_table =", req.block_table)
+
+    # decode结束, 释放block
+    release_request(req, block_manager)
 
 
 if __name__ == "__main__":
